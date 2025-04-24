@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  # Backend PostgreSQL database
+  backend-db:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - backend-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Verification PostgreSQL database
+  verification-db:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: verification
+    ports:
+      - "5434:5432"
+    volumes:
+      - verification-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Verifiable PostgreSQL proxy
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5432:5432"
+    depends_on:
+      backend-db:
+        condition: service_healthy
+      verification-db:
+        condition: service_healthy
+    command: [
+      "--listen=0.0.0.0:5432",
+      "--backend-host=backend-db",
+      "--backend-port=5432",
+      "--verification-host=verification-db",
+      "--verification-port=5432",
+      "--worker-pool-size=4",
+      "--log-level=debug"
+    ]
+
+volumes:
+  backend-data:
+  verification-data:
