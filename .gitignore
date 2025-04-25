@@ -24,3 +24,10 @@ go.work
 
 # Logs
 *.log
+
+# Binaries
+verifiable-postgres-proxy
+
+TechSpec.md
+
+repomix-output.xml

@@ -1,8 +1,15 @@
 package commitment
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"hash"
+	"math"
 	"sort"
+	"time"
 
 	"github.com/verifiable-postgres/proxy/pkg/types"
 )
@@ -90,29 +97,79 @@ func GenerateDatabaseRoot(tableRoots map[string][32]byte) ([32]byte, error) {
 
 // GenerateRowID generates a deterministic row ID from primary key values
 func GenerateRowID(tableName string, pkValues map[string]types.Value) types.RowID {
-	// Get primary key column names
+	// Get primary key column names and sort them for deterministic ordering
 	pkNames := make([]string, 0, len(pkValues))
 	for name := range pkValues {
 		pkNames = append(pkNames, name)
 	}
 	sort.Strings(pkNames)
 
-	// Build a map with sorted keys
-	sortedPK := make(map[string]types.Value)
+	// Create a hash to build our deterministic ID
+	h := sha256.New()
+
+	// Add table name to the hash
+	h.Write([]byte(tableName))
+
+	// Process each primary key column in sorted order
 	for _, name := range pkNames {
-		sortedPK[name] = pkValues[name]
+		value := pkValues[name]
+		// Add column name
+		h.Write([]byte(name))
+		
+		// Serialize the value based on its type
+		serializeValueToHash(h, value)
 	}
 
-	// Serialize the primary key values
-	serialized, err := json.Marshal(map[string]interface{}{
-		"table": tableName,
-		"pk":    sortedPK,
-	})
-	if err != nil {
-		// Fallback to a simple string if serialization fails
-		return types.RowID(tableName + "_pk_error")
+	// Generate the hash
+	hashBytes := h.Sum(nil)
+	
+	// Return the base64-encoded hash as the row ID, prefixed with table name for readability
+	return types.RowID(fmt.Sprintf("%s_%s", tableName, base64.StdEncoding.EncodeToString(hashBytes)[:22]))
+}
+
+// serializeValueToHash serializes a value to the hash in a type-specific deterministic way
+func serializeValueToHash(h hash.Hash, value interface{}) {
+	if value == nil {
+		h.Write([]byte("nil"))
+		return
 	}
 
-	// Convert to a more readable format (hex or base64)
-	return types.RowID(tableName + "_" + string(serialized))
+	switch v := value.(type) {
+	case int:
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, uint64(v))
+		h.Write(buf)
+	case int64:
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, uint64(v))
+		h.Write(buf)
+	case float64:
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, math.Float64bits(v))
+		h.Write(buf)
+	case bool:
+		if v {
+			h.Write([]byte{1})
+		} else {
+			h.Write([]byte{0})
+		}
+	case string:
+		h.Write([]byte(v))
+	case []byte:
+		h.Write(v)
+	case time.Time:
+		// Convert to nanoseconds since epoch for deterministic ordering
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, uint64(v.UnixNano()))
+		h.Write(buf)
+	default:
+		// For other types, use JSON as a last resort
+		jsonData, err := json.Marshal(v)
+		if err != nil {
+			// If marshaling fails, write a placeholder
+			h.Write([]byte("error_serializing"))
+		} else {
+			h.Write(jsonData)
+		}
+	}
 }

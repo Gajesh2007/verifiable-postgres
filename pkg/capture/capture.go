@@ -8,6 +8,7 @@ import (
 
 	"github.com/verifiable-postgres/proxy/pkg/log"
 	"github.com/verifiable-postgres/proxy/pkg/types"
+	"github.com/verifiable-postgres/proxy/pkg/commitment"
 )
 
 // Interface for database operations (either sql.DB or sql.Tx)
@@ -218,16 +219,11 @@ func captureTableState(ctx context.Context, executor dbExecutor, schema types.Ta
 				}
 			}
 			
-			// Create a simple row ID for V1
-			// In a real implementation, we would use a more robust method
-			idStr := schema.Name + ":"
-			for _, pkCol := range schema.PKColumns {
-				idStr += fmt.Sprintf("%v:", pkValues[pkCol])
-			}
-			row.ID = types.RowID(idStr)
+			// Use standardized row ID generation from commitment package
+			row.ID = commitment.GenerateRowID(schema.Name, pkValues)
 		} else {
 			// Fallback if no primary key
-			row.ID = types.RowID(fmt.Sprintf("%s:row:%d", schema.Name, len(result)))
+			row.ID = types.RowID(fmt.Sprintf("%s:fallback:%d", schema.Name, len(result)))
 		}
 		
 		// Map column names to values

@@ -665,9 +665,14 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 	var preStateData map[string][]types.Row
 	var preRootCaptured [32]byte
 	var tableSchemas map[string]types.TableSchema
+	var needVerification bool
 
-	if queryInfo.Type == types.Insert || queryInfo.Type == types.Update || queryInfo.Type == types.Delete {
-		// Capture pre-state for affected tables
+	// Flag for DML queries that need state capture
+	needVerification = queryInfo.Type == types.Insert || queryInfo.Type == types.Update || queryInfo.Type == types.Delete
+
+	// Capture pre-state for affected tables (NOTE: This still has the race condition in V1)
+	// A future V2 implementation should use WAL/logical decoding to eliminate this race condition
+	if needVerification {
 		var captureErr error
 		
 		// Use transaction if in one, otherwise use the direct DB connection
@@ -706,19 +711,51 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 		}
 	}
 
-	// Execute the query on the backend database
-	var rows *sql.Rows
-	var execErr error
+	// Create a transaction for non-transaction queries to ensure post-state capture is atomic
+	// This eliminates the race condition for post-state capture
+	var tx *sql.Tx
+	var isLocalTx bool
+	var executeErr error
 	
-	// Execute the query in the current transaction if we're in one
-	if c.inTransaction && c.backendTx != nil {
-		rows, execErr = c.backendTx.QueryContext(c.ctx, msg.String)
+	if !c.inTransaction && needVerification {
+		// For DML queries not in a transaction, create a local transaction
+		tx, executeErr = c.backendDB.BeginTx(c.ctx, nil)
+		if executeErr != nil {
+			log.Error("Failed to begin local transaction", "error", executeErr)
+			err := c.sendErrorResponse("ERROR", "XX000", fmt.Sprintf("Error beginning transaction: %s", executeErr))
+			if err != nil {
+				return fmt.Errorf("failed to send error response: %w", err)
+			}
+			return c.sendReadyForQuery()
+		}
+		isLocalTx = true
+	} else if c.inTransaction {
+		// Use existing transaction
+		tx = c.backendTx
+	}
+
+	// Execute the query
+	var rows *sql.Rows
+	var postStateData map[string][]types.Row
+	var postRootClaimed [32]byte
+	
+	// Execute the query in the appropriate context (transaction or direct DB)
+	if needVerification || c.inTransaction {
+		// Use transaction (either existing or local)
+		rows, executeErr = tx.QueryContext(c.ctx, msg.String)
 	} else {
-		rows, execErr = c.backendDB.QueryContext(c.ctx, msg.String)
+		// Simple query, no transaction needed
+		rows, executeErr = c.backendDB.QueryContext(c.ctx, msg.String)
 	}
 	
-	if execErr != nil {
-		log.Error("Failed to execute query", "error", execErr, "query", msg.String)
+	// Handle execution error
+	if executeErr != nil {
+		// If we created a local transaction, roll it back
+		if isLocalTx && tx != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				log.Error("Failed to rollback local transaction", "error", rbErr)
+			}
+		}
 		
 		// If in a transaction, mark it as failed
 		if c.inTransaction {
@@ -726,32 +763,36 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 		}
 		
 		// Send error to client
-		errMsg := fmt.Sprintf("Error executing query: %s", execErr)
+		errMsg := fmt.Sprintf("Error executing query: %s", executeErr)
 		err := c.sendErrorResponse("ERROR", "42000", errMsg)
 		if err != nil {
 			return fmt.Errorf("failed to send error response: %w", err)
 		}
 		
-		// Send ReadyForQuery with correct transaction status
-		err = c.sendReadyForQuery()
-		if err != nil {
-			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
-		}
-		return nil
+		return c.sendReadyForQuery()
 	}
 	
 	defer rows.Close()
 
 	// Process the result rows and send to client
-	// This is a simplified implementation that doesn't handle all result formats
 	columnNames, err := rows.Columns()
 	if err != nil {
+		if isLocalTx && tx != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				log.Error("Failed to rollback local transaction", "error", rbErr)
+			}
+		}
 		return fmt.Errorf("failed to get column names: %w", err)
 	}
 
 	// Send row description
 	err = c.sendRowDescription(columnNames)
 	if err != nil {
+		if isLocalTx && tx != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				log.Error("Failed to rollback local transaction", "error", rbErr)
+			}
+		}
 		return fmt.Errorf("failed to send row description: %w", err)
 	}
 
@@ -766,6 +807,11 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 		}
 
 		if err := rows.Scan(valuePtrs...); err != nil {
+			if isLocalTx && tx != nil {
+				if rbErr := tx.Rollback(); rbErr != nil {
+					log.Error("Failed to rollback local transaction", "error", rbErr)
+				}
+			}
 			return fmt.Errorf("failed to scan row: %w", err)
 		}
 
@@ -782,28 +828,32 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 		// Send data row
 		err = c.sendDataRow(stringValues)
 		if err != nil {
+			if isLocalTx && tx != nil {
+				if rbErr := tx.Rollback(); rbErr != nil {
+					log.Error("Failed to rollback local transaction", "error", rbErr)
+				}
+			}
 			return fmt.Errorf("failed to send data row: %w", err)
 		}
 	}
 
 	if err := rows.Err(); err != nil {
+		if isLocalTx && tx != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				log.Error("Failed to rollback local transaction", "error", rbErr)
+			}
+		}
 		return fmt.Errorf("error iterating rows: %w", err)
 	}
 
-	// For DML queries, we need to capture post-state and send verification job
-	var postRootClaimed [32]byte
-
-	if queryInfo.Type == types.Insert || queryInfo.Type == types.Update || queryInfo.Type == types.Delete {
-		// Capture post-state for affected tables
-		var postStateData map[string][]types.Row
+	// For DML queries, capture post-state BEFORE committing the transaction
+	// This ensures the post-state is captured atomically with the query execution
+	if needVerification {
+		// Capture post-state within the transaction (either user's or our local one)
 		var captureErr error
 		
-		// Use transaction if in one, otherwise use the direct DB connection
-		if c.inTransaction && c.backendTx != nil {
-			postStateData, _, captureErr = capture.CapturePostStateInTx(c.ctx, queryInfo, c.backendTx)
-		} else {
-			postStateData, _, captureErr = capture.CapturePostState(c.ctx, queryInfo, c.backendDB)
-		}
+		// Always use transaction here - it's either user's transaction or our local one
+		postStateData, _, captureErr = capture.CapturePostStateInTx(c.ctx, queryInfo, tx)
 		
 		if captureErr != nil {
 			log.Error("Failed to capture post-state", "error", captureErr)
@@ -859,6 +909,18 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 				TableSchemas:    tableSchemas,
 			}
 			c.server.SendVerificationJob(job)
+		}
+	}
+
+	// If we created a local transaction, commit it now after capturing post-state
+	if isLocalTx && tx != nil {
+		if commitErr := tx.Commit(); commitErr != nil {
+			log.Error("Failed to commit local transaction", "error", commitErr)
+			err := c.sendErrorResponse("ERROR", "XX000", fmt.Sprintf("Error committing transaction: %s", commitErr))
+			if err != nil {
+				return fmt.Errorf("failed to send error response: %w", err)
+			}
+			return c.sendReadyForQuery()
 		}
 	}
 

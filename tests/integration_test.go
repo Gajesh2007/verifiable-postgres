@@ -1,8 +1,13 @@
 package tests
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
+	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +20,7 @@ import (
 	"github.com/verifiable-postgres/proxy/pkg/config"
 	"github.com/verifiable-postgres/proxy/pkg/log"
 	"github.com/verifiable-postgres/proxy/pkg/proxy"
+	"github.com/verifiable-postgres/proxy/pkg/types"
 )
 
 // TestIntegration runs integration tests with the proxy and databases
@@ -31,8 +37,11 @@ func TestIntegration(t *testing.T) {
 	cfg.VerificationDB.Port = 5434     // Verification DB port
 	cfg.Log.Level = "debug"
 
-	// Initialize logs
-	log.Setup(&cfg.Log)
+	// Create a log buffer to capture logs
+	logBuffer := &bytes.Buffer{}
+
+	// Initialize logs to write to our buffer
+	log.SetupWithWriter(&cfg.Log, logBuffer)
 
 	// Start the proxy server
 	server, err := proxy.NewServer(cfg)
@@ -58,8 +67,9 @@ func TestIntegration(t *testing.T) {
 	// Run the tests
 	t.Run("TestSimpleQueries", func(t *testing.T) { testSimpleQueries(t, cfg) })
 	t.Run("TestTransactions", func(t *testing.T) { testTransactions(t, cfg) })
-	t.Run("TestNonDeterministicWarnings", func(t *testing.T) { testNonDeterministicWarnings(t, cfg) })
-	t.Run("TestVerification", func(t *testing.T) { testVerification(t, cfg) })
+	t.Run("TestNonDeterministicWarnings", func(t *testing.T) { testNonDeterministicWarnings(t, cfg, logBuffer) })
+	t.Run("TestVerification", func(t *testing.T) { testVerification(t, cfg, logBuffer) })
+	t.Run("TestFailedVerification", func(t *testing.T) { testFailedVerification(t, cfg, logBuffer) })
 
 	// Stop the server
 	cancel()
@@ -242,52 +252,112 @@ func testTransactions(t *testing.T, cfg *config.Config) {
 }
 
 // testNonDeterministicWarnings tests detection of non-deterministic functions
-func testNonDeterministicWarnings(t *testing.T, cfg *config.Config) {
+func testNonDeterministicWarnings(t *testing.T, cfg *config.Config, logBuffer *bytes.Buffer) {
 	pool := setupTestDatabase(t, cfg)
 	defer pool.Close()
 
 	ctx := context.Background()
 
-	// Test non-deterministic function (NOW())
-	_, err := pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS test_timestamps (
-			id SERIAL PRIMARY KEY,
-			created_at TIMESTAMP
-		);
-		INSERT INTO test_timestamps (created_at) VALUES (NOW());
-	`)
-	require.NoError(t, err, "Failed to execute non-deterministic query")
+	// Reset the log buffer
+	logBuffer.Reset()
 
-	// Test non-deterministic function (RANDOM())
-	_, err = pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS test_random (
-			id SERIAL PRIMARY KEY,
-			random_value FLOAT
-		);
-		INSERT INTO test_random (random_value) VALUES (RANDOM());
-	`)
-	require.NoError(t, err, "Failed to execute non-deterministic query")
+	// Run a query with non-deterministic function
+	_, err := pool.Exec(ctx, "SELECT id, name, now() FROM test_users")
+	require.NoError(t, err, "Failed to execute query")
 
-	// Verify the data exists
-	var count int
-	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM test_timestamps").Scan(&count)
-	require.NoError(t, err, "Failed to count timestamps")
-	assert.Equal(t, 1, count, "Expected 1 timestamp record")
+	// Give some time for logging
+	time.Sleep(500 * time.Millisecond)
 
-	err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM test_random").Scan(&count)
-	require.NoError(t, err, "Failed to count random records")
-	assert.Equal(t, 1, count, "Expected 1 random record")
+	// Check logs for non-deterministic warning
+	logOutput := logBuffer.String()
+	assert.Contains(t, logOutput, "non-deterministic", "Expected non-deterministic function warning")
+	assert.Contains(t, logOutput, "now()", "Expected warning for now() function")
 
-	// Note: We can't directly check if warnings were logged
-	// That would require a custom log hook or reading log output
+	// Reset the buffer for next test
+	logBuffer.Reset()
+
+	// Run another query with multiple non-deterministic functions
+	_, err = pool.Exec(ctx, "SELECT id, random(), uuid_generate_v4() FROM test_users")
+	require.NoError(t, err, "Failed to execute query")
+
+	// Give some time for logging
+	time.Sleep(500 * time.Millisecond)
+
+	// Check logs for non-deterministic warnings
+	logOutput = logBuffer.String()
+	assert.Contains(t, logOutput, "non-deterministic", "Expected non-deterministic function warning")
+	assert.Contains(t, logOutput, "random()", "Expected warning for random() function")
 }
 
-// testVerification tests the verification process
-func testVerification(t *testing.T, cfg *config.Config) {
+// findVerificationResults searches the log buffer for verification results matching the query
+func findVerificationResults(logBuffer *bytes.Buffer, tableNameContains string) ([]types.VerificationResult, bool) {
+	logOutput := logBuffer.String()
+
+	// Define a regex pattern to find verification result JSON
+	pattern := `"level":"info".*?"message":"Verification result".*?"result":({.*?})`
+	regex := regexp.MustCompile(pattern)
+	matches := regex.FindAllSubmatch([]byte(logOutput), -1)
+
+	var results []types.VerificationResult
+	found := false
+
+	// Also look for state commitment records to match with transaction IDs
+	commitRecordPattern := `"level":"info".*?"message":"State commitment".*?"record":({.*?})`
+	commitRegex := regexp.MustCompile(commitRecordPattern)
+	commitMatches := commitRegex.FindAllSubmatch([]byte(logOutput), -1)
+
+	// Map of TX IDs to queries for later matching
+	txToQuery := make(map[uint64][]string)
+
+	// Extract transaction IDs and queries from state commitment records
+	for _, match := range commitMatches {
+		if len(match) >= 2 {
+			jsonStr := match[1]
+			var record types.StateCommitmentRecord
+			if err := json.Unmarshal(jsonStr, &record); err == nil {
+				for _, query := range record.QuerySequence {
+					if tableNameContains == "" || (tableNameContains != "" && containsIgnoreCase(query, tableNameContains)) {
+						txToQuery[record.TxID] = record.QuerySequence
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Extract verification results and match with the TX IDs we found
+	for _, match := range matches {
+		if len(match) >= 2 {
+			jsonStr := match[1]
+			var result types.VerificationResult
+			if err := json.Unmarshal(jsonStr, &result); err == nil {
+				// Check if this result is for a transaction that affected our target table
+				if _, ok := txToQuery[result.TxID]; ok {
+					found = true
+					results = append(results, result)
+				}
+			}
+		}
+	}
+
+	return results, found
+}
+
+// containsIgnoreCase checks if a string contains another string, case-insensitive
+func containsIgnoreCase(s, substr string) bool {
+	s, substr = strings.ToLower(s), strings.ToLower(substr)
+	return strings.Contains(s, substr)
+}
+
+// testVerification tests successful verification
+func testVerification(t *testing.T, cfg *config.Config, logBuffer *bytes.Buffer) {
 	pool := setupTestDatabase(t, cfg)
 	defer pool.Close()
 
 	ctx := context.Background()
+
+	// Reset the log buffer
+	logBuffer.Reset()
 
 	// Clean start
 	_, err := pool.Exec(ctx, `DROP TABLE IF EXISTS test_verif; CREATE TABLE test_verif (id SERIAL PRIMARY KEY, value TEXT);`)
@@ -305,8 +375,8 @@ func testVerification(t *testing.T, cfg *config.Config) {
 	_, err = pool.Exec(ctx, "DELETE FROM test_verif WHERE id = 1")
 	require.NoError(t, err, "Failed to delete test data")
 
-	// Give verification some time to complete
-	time.Sleep(1 * time.Second)
+	// Give verification some time to complete (increased for more reliable test)
+	time.Sleep(3 * time.Second)
 
 	// Verify count is 0
 	var count int
@@ -314,6 +384,73 @@ func testVerification(t *testing.T, cfg *config.Config) {
 	require.NoError(t, err, "Failed to count records")
 	assert.Equal(t, 0, count, "Expected 0 records")
 
-	// Note: We can't directly verify that verification succeeded
-	// That would require reading verification results from logs or a database
+	// Now verify that verification was successful by checking logs
+	results, found := findVerificationResults(logBuffer, "test_verif")
+	assert.True(t, found, "Expected to find verification results in logs")
+
+	// Check that we have successful verification results
+	successfulVerifications := 0
+	for _, result := range results {
+		if result.Success {
+			successfulVerifications++
+		}
+	}
+
+	// We should have at least the insert, update, and delete verifications
+	assert.GreaterOrEqual(t, successfulVerifications, 3, "Expected at least 3 successful verifications")
+}
+
+// testFailedVerification intentionally tests verification failure by modifying backend data directly
+func testFailedVerification(t *testing.T, cfg *config.Config, logBuffer *bytes.Buffer) {
+	pool := setupTestDatabase(t, cfg)
+	defer pool.Close()
+
+	ctx := context.Background()
+
+	// Reset the log buffer
+	logBuffer.Reset()
+
+	// Clean start
+	_, err := pool.Exec(ctx, `DROP TABLE IF EXISTS test_fail; CREATE TABLE test_fail (id SERIAL PRIMARY KEY, value TEXT);`)
+	require.NoError(t, err, "Failed to create test table")
+
+	// Insert initial data
+	_, err = pool.Exec(ctx, "INSERT INTO test_fail (value) VALUES ('initial')")
+	require.NoError(t, err, "Failed to insert test data")
+
+	// Give verification some time to complete
+	time.Sleep(1 * time.Second)
+
+	// Connect directly to the backend database to modify data, bypassing the proxy
+	// This will create a state that won't match during verification
+	backendConnStr := fmt.Sprintf("postgres://postgres:postgres@localhost:%d/postgres", cfg.BackendDB.Port)
+	backendPool, err := pgxpool.New(ctx, backendConnStr)
+	require.NoError(t, err, "Failed to connect to backend database")
+	defer backendPool.Close()
+
+	// Modify data directly in the backend
+	_, err = backendPool.Exec(ctx, "UPDATE test_fail SET value = 'modified_directly' WHERE id = 1")
+	require.NoError(t, err, "Failed to update backend directly")
+
+	// Now perform an update through the proxy
+	// This should fail verification because the pre-state won't match
+	_, err = pool.Exec(ctx, "UPDATE test_fail SET value = 'through_proxy' WHERE id = 1")
+	require.NoError(t, err, "Failed to update through proxy")
+
+	// Give verification sufficient time to complete
+	time.Sleep(3 * time.Second)
+
+	// Find verification results for the test_fail table
+	results, found := findVerificationResults(logBuffer, "test_fail")
+	assert.True(t, found, "Expected to find verification results for test_fail")
+
+	// At least one verification should have failed
+	failedVerifications := 0
+	for _, result := range results {
+		if !result.Success {
+			failedVerifications++
+		}
+	}
+
+	assert.GreaterOrEqual(t, failedVerifications, 1, "Expected at least one failed verification for test_fail")
 }

@@ -1,0 +1,50 @@
+# Verifiable Postgres Proxy Configuration
+# This is an example configuration file that documents all available options
+
+# Proxy settings
+proxy:
+  listen_addr: "localhost:5432"  # Address to listen on
+  max_connections: 100           # Maximum number of client connections
+  metrics_addr: "localhost:2112" # Address for metrics HTTP server
+
+# Backend database settings
+backend:
+  host: "localhost"           # Backend database host
+  port: 5433                  # Backend database port
+  user: "postgres"            # Backend database user
+  password: "postgres"        # Backend database password
+  dbname: "postgres"          # Backend database name
+  max_open_conns: 20          # Maximum number of open connections to the backend
+  max_idle_conns: 10          # Maximum number of idle connections to the backend
+  conn_lifetime: "5m"         # Maximum lifetime of a connection (Go duration format)
+
+# Verification database settings
+verification:
+  host: "localhost"           # Verification database host
+  port: 5434                  # Verification database port
+  user: "postgres"            # Verification database user
+  password: "postgres"        # Verification database password
+  dbname: "verification"      # Verification database name
+  max_open_conns: 20          # Maximum number of open connections to the verification DB
+  max_idle_conns: 10          # Maximum number of idle connections to the verification DB
+  conn_lifetime: "5m"         # Maximum lifetime of a connection (Go duration format)
+
+# Replay engine settings
+replay:
+  worker_pool_size: 4         # Number of verification workers
+  job_queue_size: 1000        # Size of the verification job queue
+  retry_attempts: 3           # Number of retry attempts for failed verification jobs
+  retry_delay: "1s"           # Delay between retry attempts (Go duration format)
+
+# Logging settings
+log:
+  level: "info"              # Log level (debug, info, warn, error)
+  format: "json"             # Log format (json, text)
+  file: ""                   # Log file path (if empty, logs to console)
+  console: true              # Whether to log to console
+
+# Feature flags
+features:
+  enable_verification: true             # Enable verification
+  log_nondeterministic_warnings: true   # Log warnings for non-deterministic queries
+  use_wal_for_state_capture: false      # Use WAL for state capture (reserved for V2)

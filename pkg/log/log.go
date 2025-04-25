@@ -47,6 +47,36 @@ func Setup(cfg *config.LogConfig) {
 	slog.SetDefault(Logger)
 }
 
+// SetupWithWriter initializes the logger with the given configuration and writer
+// This is useful for tests that need to capture log output
+func SetupWithWriter(cfg *config.LogConfig, writer io.Writer) {
+	var handler slog.Handler
+
+	// Configure the log level
+	var level slog.Level
+	switch cfg.Level {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	// Configure the log format (always use JSON for test writer to make parsing easier)
+	handler = slog.NewJSONHandler(writer, &slog.HandlerOptions{
+		Level: level,
+	})
+
+	// Create the logger
+	Logger = slog.New(handler)
+	slog.SetDefault(Logger)
+}
+
 // SetOutput sets the output destination for the logger
 func SetOutput(w io.Writer) {
 	var handler slog.Handler

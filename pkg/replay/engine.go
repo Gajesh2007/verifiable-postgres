@@ -2,14 +2,15 @@ package replay
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // Import pgx driver
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/verifiable-postgres/proxy/pkg/capture"
 	"github.com/verifiable-postgres/proxy/pkg/commitment"
 	"github.com/verifiable-postgres/proxy/pkg/config"
 	"github.com/verifiable-postgres/proxy/pkg/log"
@@ -26,6 +27,7 @@ type Engine struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	metrics    *metrics.Metrics
+	dbPool     *pgxpool.Pool  // Connection pool for verification database
 }
 
 // NewEngine creates a new replay engine
@@ -41,6 +43,26 @@ func NewEngine(cfg *config.Config, jobQueue chan types.VerificationJob, metrics 
 		cancel:   cancel,
 		metrics:  metrics,
 	}
+
+	// Initialize connection pool for verification database
+	poolConfig, err := pgxpool.ParseConfig(cfg.VerificationDB.DSN())
+	if err != nil {
+		cancel() // Clean up context
+		return nil, fmt.Errorf("failed to parse DB pool config: %w", err)
+	}
+
+	// Set pool configuration options
+	poolConfig.MaxConns = int32(cfg.ReplayEngine.WorkerPoolSize * 2) // Allow some extra connections for scalability
+	poolConfig.MinConns = int32(cfg.ReplayEngine.WorkerPoolSize)
+	
+	// Create the pool
+	dbPool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		cancel() // Clean up context
+		return nil, fmt.Errorf("failed to create DB connection pool: %w", err)
+	}
+	
+	engine.dbPool = dbPool
 
 	return engine, nil
 }
@@ -73,6 +95,11 @@ func (e *Engine) Stop() {
 
 	// Wait for workers to finish
 	e.workerWg.Wait()
+
+	// Close the DB pool
+	if e.dbPool != nil {
+		e.dbPool.Close()
+	}
 
 	// Cancel main context
 	e.cancel()
@@ -124,62 +151,52 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 		Timestamp:       time.Now(),
 	}
 
-	// Connect to verification database
-	db, err := sql.Open("pgx", e.cfg.VerificationDB.DSN())
+	// Acquire a connection from the pool
+	conn, err := e.dbPool.Acquire(ctx)
 	if err != nil {
-		result.Error = fmt.Sprintf("Failed to connect to verification DB: %v", err)
+		result.Error = fmt.Sprintf("Failed to acquire DB connection: %v", err)
 		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
-	defer db.Close()
+	// Release the connection back to the pool when done
+	defer conn.Release()
 
 	// Begin transaction
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to begin transaction: %v", err)
 		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 
-	// Ensure transaction is rolled back
-	defer tx.Rollback()
+	// Always ensure transaction is rolled back when we're done
+	// to clean the state for the next verification
+	defer func() {
+		if tx != nil {
+			tx.Rollback(ctx)
+		}
+	}()
 
 	// Setup verification database with pre-state
-	if err := SetupVerificationDB(ctx, tx, job.TableSchemas, job.PreStateData); err != nil {
+	if err := SetupVerificationDBWithPgx(ctx, tx, job.TableSchemas, job.PreStateData); err != nil {
 		result.Error = fmt.Sprintf("Failed to setup verification DB: %v", err)
 		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 
 	// Set deterministic session parameters
-	if err := SetDeterministicSessionParams(ctx, tx); err != nil {
+	if err := SetDeterministicSessionParamsWithPgx(ctx, tx); err != nil {
 		result.Error = fmt.Sprintf("Failed to set deterministic session parameters: %v", err)
 		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 
 	// Execute queries deterministically
-	if err := ExecuteQueriesDeterministically(ctx, tx, job.QuerySequence); err != nil {
+	if err := ExecuteQueriesDeterministicallyWithPgx(ctx, tx, job.QuerySequence); err != nil {
 		result.Error = fmt.Sprintf("Failed to execute queries: %v", err)
 		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
-
-	// Commit transaction to apply changes
-	if err := tx.Commit(); err != nil {
-		result.Error = fmt.Sprintf("Failed to commit transaction: %v", err)
-		e.metrics.VerificationCompleted(false, time.Since(startTime))
-		return result
-	}
-
-	// Start a new transaction for post-state capture
-	tx, err = db.BeginTx(ctx, nil)
-	if err != nil {
-		result.Error = fmt.Sprintf("Failed to begin post-state transaction: %v", err)
-		e.metrics.VerificationCompleted(false, time.Since(startTime))
-		return result
-	}
-	defer tx.Rollback()
 
 	// Convert job to query info for post-state capture
 	queryInfo := &types.QueryInfo{
@@ -192,8 +209,9 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 		queryInfo.AffectedTables = append(queryInfo.AffectedTables, tableName)
 	}
 
-	// Capture post-state
-	postStateData, _, err := capture.CapturePostState(ctx, queryInfo, db)
+	// Capture post-state BEFORE committing the transaction
+	// This ensures we capture the exact state produced by the transaction
+	postStateData, err := CapturePostStateWithPgx(ctx, queryInfo, tx, job.TableSchemas)
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to capture post-state: %v", err)
 		e.metrics.VerificationCompleted(false, time.Since(startTime))
@@ -239,8 +257,112 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 		}
 	}
 	
+	// Transaction will be automatically rolled back by the defer function
+	// We don't want to commit it because we want a clean state for the next verification
+	
 	// Record metrics for completed verification
 	e.metrics.VerificationCompleted(success, time.Since(startTime))
 
 	return result
+}
+
+// CapturePostStateWithPgx captures the post-state using pgx transaction
+func CapturePostStateWithPgx(ctx context.Context, queryInfo *types.QueryInfo, tx pgx.Tx, schemas map[string]types.TableSchema) (map[string][]types.Row, error) {
+	if queryInfo == nil || len(queryInfo.AffectedTables) == 0 {
+		return nil, fmt.Errorf("no tables affected")
+	}
+
+	// Capture state for each affected table
+	postState := make(map[string][]types.Row)
+	for _, tableName := range queryInfo.AffectedTables {
+		schema, ok := schemas[tableName]
+		if !ok {
+			log.Warn("Schema not found for table", "table", tableName)
+			continue
+		}
+
+		// Capture all rows from the table for simplicity in V1
+		rows, err := captureTableStateWithPgx(ctx, tx, schema)
+		if err != nil {
+			log.Error("Failed to capture table state", "table", tableName, "error", err)
+			continue
+		}
+
+		postState[tableName] = rows
+	}
+
+	return postState, nil
+}
+
+// captureTableStateWithPgx captures the current state of a table using pgx transaction
+func captureTableStateWithPgx(ctx context.Context, tx pgx.Tx, schema types.TableSchema) ([]types.Row, error) {
+	// Build query to select all columns
+	columnNames := make([]string, len(schema.Columns))
+	for i, col := range schema.Columns {
+		columnNames[i] = col.Name
+	}
+	
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columnNames, ", "), schema.Name)
+	
+	// Execute query
+	rows, err := tx.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query table state: %w", err)
+	}
+	defer rows.Close()
+
+	// Process rows
+	var result []types.Row
+	for rows.Next() {
+		// Create a slice to hold the values
+		values := make([]interface{}, len(columnNames))
+		scans := make([]interface{}, len(columnNames))
+		
+		// Create pointers to scan into
+		for i := range values {
+			scans[i] = &values[i]
+		}
+		
+		// Scan row values
+		if err := rows.Scan(scans...); err != nil {
+			return nil, fmt.Errorf("failed to scan row values: %w", err)
+		}
+		
+		// Create row with values
+		row := types.Row{
+			Values: make(map[string]types.Value),
+		}
+		
+		// Generate row ID using primary key values
+		if len(schema.PKColumns) > 0 {
+			pkValues := make(map[string]types.Value)
+			for _, pkCol := range schema.PKColumns {
+				for i, colName := range columnNames {
+					if colName == pkCol {
+						pkValues[pkCol] = values[i]
+						break
+					}
+				}
+			}
+			
+			// Use standardized row ID generation from commitment package
+			row.ID = commitment.GenerateRowID(schema.Name, pkValues)
+		} else {
+			// Fallback if no primary key
+			row.ID = types.RowID(fmt.Sprintf("%s:fallback:%d", schema.Name, len(result)))
+		}
+		
+		// Map column names to values
+		for i, colName := range columnNames {
+			row.Values[colName] = values[i]
+		}
+		
+		result = append(result, row)
+	}
+	
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+	
+	return result, nil
 }

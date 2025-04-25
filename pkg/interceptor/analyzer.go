@@ -3,8 +3,8 @@ package interceptor
 import (
 	"fmt"
 	"regexp"
-	"strings"
 
+	"github.com/blastrain/vitess-sqlparser/sqlparser"
 	"github.com/verifiable-postgres/proxy/pkg/types"
 )
 
@@ -30,14 +30,19 @@ func AnalyzeQuery(sql string) (*types.QueryInfo, error) {
 		IsDeterministic: true, // Assume deterministic by default
 	}
 
-	// Determine query type
-	queryInfo.Type = determineQueryType(sql)
+	// Parse the SQL query using vitess parser
+	stmt, err := sqlparser.Parse(sql)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse SQL query: %w", err)
+	}
 
-	// Extract affected tables
-	tables, err := extractTables(sql, queryInfo.Type)
+	// Determine query type and extract affected tables
+	tables, queryType, err := extractTablesFromAST(stmt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract tables: %w", err)
 	}
+
+	queryInfo.Type = queryType
 	queryInfo.AffectedTables = tables
 
 	// Check for non-deterministic functions
@@ -48,146 +53,176 @@ func AnalyzeQuery(sql string) (*types.QueryInfo, error) {
 	return queryInfo, nil
 }
 
-// determineQueryType determines the type of query
-func determineQueryType(sql string) types.QueryType {
-	sql = strings.TrimSpace(sql)
-	sqlUpper := strings.ToUpper(sql)
+// extractTablesFromAST extracts tables from the SQL AST and determines the query type
+func extractTablesFromAST(stmt sqlparser.Statement) ([]string, types.QueryType, error) {
+	tableMap := make(map[string]struct{}) // Use map to ensure uniqueness
+	var queryType types.QueryType
 
-	if strings.HasPrefix(sqlUpper, "SELECT") {
-		return types.Select
-	} else if strings.HasPrefix(sqlUpper, "INSERT") {
-		return types.Insert
-	} else if strings.HasPrefix(sqlUpper, "UPDATE") {
-		return types.Update
-	} else if strings.HasPrefix(sqlUpper, "DELETE") {
-		return types.Delete
-	} else {
-		return types.Other
+	switch stmt := stmt.(type) {
+	case *sqlparser.Select:
+		queryType = types.Select
+		extractTablesFromSelectStatement(stmt, tableMap)
+
+	case *sqlparser.Insert:
+		queryType = types.Insert
+		extractTablesFromInsertStatement(stmt, tableMap)
+
+	case *sqlparser.Update:
+		queryType = types.Update
+		extractTablesFromUpdateStatement(stmt, tableMap)
+
+	case *sqlparser.Delete:
+		queryType = types.Delete
+		extractTablesFromDeleteStatement(stmt, tableMap)
+
+	default:
+		queryType = types.Other
+	}
+
+	// Convert map to slice
+	tables := make([]string, 0, len(tableMap))
+	for table := range tableMap {
+		tables = append(tables, table)
+	}
+
+	return tables, queryType, nil
+}
+
+// extractTablesFromSelectStatement extracts tables from a SELECT statement
+func extractTablesFromSelectStatement(stmt *sqlparser.Select, tableMap map[string]struct{}) {
+	// Extract tables from FROM clause
+	extractTablesFromTableExprs(stmt.From, tableMap)
+
+	// Extract tables from WHERE clause
+	if stmt.Where != nil {
+		extractTablesFromExpr(stmt.Where.Expr, tableMap)
+	}
+
+	// Extract tables from JOIN conditions
+	for _, join := range extractJoins(stmt.From) {
+		if join.On != nil {
+			extractTablesFromExpr(join.On, tableMap)
+		}
 	}
 }
 
-// extractTables extracts table names from a SQL query
-// Note: This is a simple implementation that doesn't handle all cases
-func extractTables(sql string, queryType types.QueryType) ([]string, error) {
-	sql = strings.TrimSpace(sql)
-	sqlUpper := strings.ToUpper(sql)
-	
-	tables := make([]string, 0)
-	
-	switch queryType {
-	case types.Select:
-		// Basic SELECT FROM table [JOIN table2...]
-		fromIdx := strings.Index(sqlUpper, "FROM")
-		if fromIdx < 0 {
-			return nil, fmt.Errorf("invalid SELECT query, missing FROM clause")
-		}
-		
-		// Extract text after FROM
-		afterFrom := sql[fromIdx+4:]
-		
-		// Find the end of the FROM clause (WHERE, GROUP BY, etc.)
-		endIdx := strings.IndexAny(strings.ToUpper(afterFrom), "WHERE GROUP ORDER LIMIT HAVING")
-		if endIdx > 0 {
-			afterFrom = afterFrom[:endIdx]
-		}
-		
-		// Split by commas and extract table names
-		parts := strings.Split(afterFrom, ",")
-		for _, part := range parts {
-			tableName := extractTableNameFromPart(part)
-			if tableName != "" {
-				tables = append(tables, tableName)
+// extractTablesFromInsertStatement extracts tables from an INSERT statement
+func extractTablesFromInsertStatement(stmt *sqlparser.Insert, tableMap map[string]struct{}) {
+	// Get the target table
+	tableName := getFullTableName(stmt.Table)
+	tableMap[tableName] = struct{}{}
+
+	// If INSERT ... SELECT, also extract tables from the SELECT part
+	if selectStmt, ok := stmt.Rows.(*sqlparser.Select); ok {
+		extractTablesFromSelectStatement(selectStmt, tableMap)
+	}
+}
+
+// extractTablesFromUpdateStatement extracts tables from an UPDATE statement
+func extractTablesFromUpdateStatement(stmt *sqlparser.Update, tableMap map[string]struct{}) {
+	// Extract the table being updated
+	for _, tableExpr := range stmt.TableExprs {
+		extractTablesFromTableExpr(tableExpr, tableMap)
+	}
+
+	// Extract tables from WHERE clause
+	if stmt.Where != nil {
+		extractTablesFromExpr(stmt.Where.Expr, tableMap)
+	}
+}
+
+// extractTablesFromDeleteStatement extracts tables from a DELETE statement
+func extractTablesFromDeleteStatement(stmt *sqlparser.Delete, tableMap map[string]struct{}) {
+	// Extract the table being deleted from
+	for _, tableExpr := range stmt.TableExprs {
+		extractTablesFromTableExpr(tableExpr, tableMap)
+	}
+
+	// Extract tables from WHERE clause
+	if stmt.Where != nil {
+		extractTablesFromExpr(stmt.Where.Expr, tableMap)
+	}
+}
+
+// extractTablesFromTableExprs extracts tables from a list of table expressions
+func extractTablesFromTableExprs(tableExprs sqlparser.TableExprs, tableMap map[string]struct{}) {
+	for _, tableExpr := range tableExprs {
+		extractTablesFromTableExpr(tableExpr, tableMap)
+	}
+}
+
+// extractTablesFromTableExpr extracts tables from a single table expression
+func extractTablesFromTableExpr(tableExpr sqlparser.TableExpr, tableMap map[string]struct{}) {
+	switch tableExpr := tableExpr.(type) {
+	case *sqlparser.AliasedTableExpr:
+		switch expr := tableExpr.Expr.(type) {
+		case sqlparser.TableName:
+			tableName := getFullTableName(expr)
+			tableMap[tableName] = struct{}{}
+		case *sqlparser.Subquery:
+			if selectStmt, ok := expr.Select.(*sqlparser.Select); ok {
+				extractTablesFromSelectStatement(selectStmt, tableMap)
 			}
 		}
-		
-	case types.Insert:
-		// INSERT INTO table
-		intoIdx := strings.Index(sqlUpper, "INTO")
-		if intoIdx < 0 {
-			return nil, fmt.Errorf("invalid INSERT query, missing INTO clause")
+	case *sqlparser.JoinTableExpr:
+		extractTablesFromTableExpr(tableExpr.LeftExpr, tableMap)
+		extractTablesFromTableExpr(tableExpr.RightExpr, tableMap)
+		if tableExpr.On != nil {
+			extractTablesFromExpr(tableExpr.On, tableMap)
 		}
-		
-		// Extract text after INTO
-		afterInto := sql[intoIdx+4:]
-		
-		// Find the end of the table name
-		endIdx := strings.IndexAny(strings.ToUpper(afterInto), "( VALUES SELECT")
-		if endIdx > 0 {
-			afterInto = afterInto[:endIdx]
-		}
-		
-		tableName := extractTableNameFromPart(afterInto)
-		if tableName != "" {
-			tables = append(tables, tableName)
-		}
-		
-	case types.Update:
-		// UPDATE table
-		updateIdx := 6 // After "UPDATE"
-		if updateIdx >= len(sql) {
-			return nil, fmt.Errorf("invalid UPDATE query")
-		}
-		
-		// Extract text after UPDATE
-		afterUpdate := sql[updateIdx:]
-		
-		// Find the end of the table name
-		endIdx := strings.Index(strings.ToUpper(afterUpdate), "SET")
-		if endIdx > 0 {
-			afterUpdate = afterUpdate[:endIdx]
-		}
-		
-		tableName := extractTableNameFromPart(afterUpdate)
-		if tableName != "" {
-			tables = append(tables, tableName)
-		}
-		
-	case types.Delete:
-		// DELETE FROM table
-		fromIdx := strings.Index(sqlUpper, "FROM")
-		if fromIdx < 0 {
-			return nil, fmt.Errorf("invalid DELETE query, missing FROM clause")
-		}
-		
-		// Extract text after FROM
-		afterFrom := sql[fromIdx+4:]
-		
-		// Find the end of the table name
-		endIdx := strings.Index(strings.ToUpper(afterFrom), "WHERE")
-		if endIdx > 0 {
-			afterFrom = afterFrom[:endIdx]
-		}
-		
-		tableName := extractTableNameFromPart(afterFrom)
-		if tableName != "" {
-			tables = append(tables, tableName)
-		}
+	case *sqlparser.ParenTableExpr:
+		extractTablesFromTableExprs(tableExpr.Exprs, tableMap)
 	}
-	
-	return tables, nil
 }
 
-// extractTableNameFromPart extracts a table name from a part of a SQL query
-func extractTableNameFromPart(part string) string {
-	// Trim whitespace
-	part = strings.TrimSpace(part)
-	
-	// Check for table name with schema
-	if strings.Contains(part, ".") {
-		parts := strings.Split(part, ".")
-		if len(parts) >= 2 {
-			return strings.TrimSpace(parts[1])
+// extractTablesFromExpr extracts tables from expressions (like WHERE conditions)
+func extractTablesFromExpr(expr sqlparser.Expr, tableMap map[string]struct{}) {
+	switch expr := expr.(type) {
+	case *sqlparser.AndExpr:
+		extractTablesFromExpr(expr.Left, tableMap)
+		extractTablesFromExpr(expr.Right, tableMap)
+	case *sqlparser.OrExpr:
+		extractTablesFromExpr(expr.Left, tableMap)
+		extractTablesFromExpr(expr.Right, tableMap)
+	case *sqlparser.ComparisonExpr:
+		extractTablesFromExpr(expr.Left, tableMap)
+		extractTablesFromExpr(expr.Right, tableMap)
+	case *sqlparser.Subquery:
+		if selectStmt, ok := expr.Select.(*sqlparser.Select); ok {
+			extractTablesFromSelectStatement(selectStmt, tableMap)
 		}
 	}
-	
-	// Check for table name with alias
-	if strings.Contains(part, " ") {
-		parts := strings.SplitN(part, " ", 2)
-		return strings.TrimSpace(parts[0])
+	// Add more cases as needed for complex expressions
+}
+
+// extractJoins extracts join expressions from table expressions
+func extractJoins(tableExprs sqlparser.TableExprs) []*sqlparser.JoinTableExpr {
+	var joins []*sqlparser.JoinTableExpr
+	for _, tableExpr := range tableExprs {
+		if join, ok := tableExpr.(*sqlparser.JoinTableExpr); ok {
+			joins = append(joins, join)
+			// Recursively extract joins from nested join expressions
+			if joinExprs := extractJoins(sqlparser.TableExprs{join.LeftExpr}); len(joinExprs) > 0 {
+				joins = append(joins, joinExprs...)
+			}
+			if joinExprs := extractJoins(sqlparser.TableExprs{join.RightExpr}); len(joinExprs) > 0 {
+				joins = append(joins, joinExprs...)
+			}
+		} else if paren, ok := tableExpr.(*sqlparser.ParenTableExpr); ok {
+			if joinExprs := extractJoins(paren.Exprs); len(joinExprs) > 0 {
+				joins = append(joins, joinExprs...)
+			}
+		}
 	}
-	
-	// Simple table name
-	return part
+	return joins
+}
+
+// getFullTableName returns the full table name including schema if present
+func getFullTableName(tableName sqlparser.TableName) string {
+	if tableName.Qualifier.IsEmpty() {
+		return tableName.Name.String()
+	}
+	return fmt.Sprintf("%s.%s", tableName.Qualifier.String(), tableName.Name.String())
 }
 
 // checkDeterminism checks if a query contains non-deterministic functions
