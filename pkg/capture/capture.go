@@ -10,14 +10,42 @@ import (
 	"github.com/verifiable-postgres/proxy/pkg/types"
 )
 
-// CapturePreState captures the pre-state of tables affected by a query
+// Interface for database operations (either sql.DB or sql.Tx)
+type dbExecutor interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
+
+// CapturePreState captures the pre-state of tables affected by a query using a database connection
 func CapturePreState(ctx context.Context, queryInfo *types.QueryInfo, db *sql.DB) (map[string][]types.Row, map[string]types.TableSchema, error) {
+	return captureState(ctx, queryInfo, db)
+}
+
+// CapturePreStateInTx captures the pre-state of tables affected by a query within a transaction
+func CapturePreStateInTx(ctx context.Context, queryInfo *types.QueryInfo, tx *sql.Tx) (map[string][]types.Row, map[string]types.TableSchema, error) {
+	return captureState(ctx, queryInfo, tx)
+}
+
+// CapturePostState captures the post-state of tables affected by a query using a database connection
+func CapturePostState(ctx context.Context, queryInfo *types.QueryInfo, db *sql.DB) (map[string][]types.Row, map[string]types.TableSchema, error) {
+	// For V1, post-state capture is the same as pre-state capture
+	return captureState(ctx, queryInfo, db)
+}
+
+// CapturePostStateInTx captures the post-state of tables affected by a query within a transaction
+func CapturePostStateInTx(ctx context.Context, queryInfo *types.QueryInfo, tx *sql.Tx) (map[string][]types.Row, map[string]types.TableSchema, error) {
+	// For V1, post-state capture is the same as pre-state capture
+	return captureState(ctx, queryInfo, tx)
+}
+
+// captureState is the generic implementation of state capture that works with both DB and Tx
+func captureState(ctx context.Context, queryInfo *types.QueryInfo, executor dbExecutor) (map[string][]types.Row, map[string]types.TableSchema, error) {
 	if queryInfo == nil || len(queryInfo.AffectedTables) == 0 {
 		return nil, nil, fmt.Errorf("no tables affected")
 	}
 
 	// Get schema information for affected tables
-	schemas, err := getTableSchemas(ctx, db, queryInfo.AffectedTables)
+	schemas, err := getTableSchemas(ctx, executor, queryInfo.AffectedTables)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to get table schemas: %w", err)
 	}
@@ -33,7 +61,7 @@ func CapturePreState(ctx context.Context, queryInfo *types.QueryInfo, db *sql.DB
 
 		// Capture all rows from the table for simplicity in V1
 		// In a real implementation, we would parse the WHERE clause
-		rows, err := captureTableState(ctx, db, schema)
+		rows, err := captureTableState(ctx, executor, schema)
 		if err != nil {
 			log.Error("Failed to capture table state", "table", tableName, "error", err)
 			continue
@@ -45,14 +73,8 @@ func CapturePreState(ctx context.Context, queryInfo *types.QueryInfo, db *sql.DB
 	return preState, schemas, nil
 }
 
-// CapturePostState captures the post-state of tables affected by a query
-func CapturePostState(ctx context.Context, queryInfo *types.QueryInfo, db *sql.DB) (map[string][]types.Row, map[string]types.TableSchema, error) {
-	// For V1, post-state capture is the same as pre-state capture
-	return CapturePreState(ctx, queryInfo, db)
-}
-
 // getTableSchemas gets schema information for the specified tables
-func getTableSchemas(ctx context.Context, db *sql.DB, tableNames []string) (map[string]types.TableSchema, error) {
+func getTableSchemas(ctx context.Context, executor dbExecutor, tableNames []string) (map[string]types.TableSchema, error) {
 	schemas := make(map[string]types.TableSchema)
 
 	for _, tableName := range tableNames {
@@ -69,7 +91,7 @@ func getTableSchemas(ctx context.Context, db *sql.DB, tableNames []string) (map[
 			ORDER BY 
 				ordinal_position
 		`
-		rows, err := db.QueryContext(ctx, query, tableName)
+		rows, err := executor.QueryContext(ctx, query, tableName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get column information for table %s: %w", tableName, err)
 		}
@@ -109,7 +131,7 @@ func getTableSchemas(ctx context.Context, db *sql.DB, tableNames []string) (map[
 			ORDER BY 
 				kcu.ordinal_position
 		`
-		pkRows, err := db.QueryContext(ctx, pkQuery, tableName)
+		pkRows, err := executor.QueryContext(ctx, pkQuery, tableName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get primary key information for table %s: %w", tableName, err)
 		}
@@ -141,7 +163,7 @@ func getTableSchemas(ctx context.Context, db *sql.DB, tableNames []string) (map[
 }
 
 // captureTableState captures the current state of a table
-func captureTableState(ctx context.Context, db *sql.DB, schema types.TableSchema) ([]types.Row, error) {
+func captureTableState(ctx context.Context, executor dbExecutor, schema types.TableSchema) ([]types.Row, error) {
 	// Build query to select all columns
 	columnNames := make([]string, len(schema.Columns))
 	for i, col := range schema.Columns {
@@ -151,7 +173,7 @@ func captureTableState(ctx context.Context, db *sql.DB, schema types.TableSchema
 	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columnNames, ", "), schema.Name)
 	
 	// Execute query
-	rows, err := db.QueryContext(ctx, query)
+	rows, err := executor.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query table state: %w", err)
 	}

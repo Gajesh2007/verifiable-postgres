@@ -164,9 +164,9 @@ func TestDatabaseStateCommitment(t *testing.T) {
 	}
 }
 
-// Integration tests require PostgreSQL to be running
-// Skip them unless explicitly enabled
-func TestIntegration(t *testing.T) {
+// Test database connection (basic connectivity)
+// Skip the test unless explicitly enabled
+func TestDatabaseConnection(t *testing.T) {
 	if os.Getenv("ENABLE_INTEGRATION_TESTS") != "1" {
 		t.Skip("Integration tests disabled")
 	}

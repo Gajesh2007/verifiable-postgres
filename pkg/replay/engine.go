@@ -13,6 +13,7 @@ import (
 	"github.com/verifiable-postgres/proxy/pkg/commitment"
 	"github.com/verifiable-postgres/proxy/pkg/config"
 	"github.com/verifiable-postgres/proxy/pkg/log"
+	"github.com/verifiable-postgres/proxy/pkg/metrics"
 	"github.com/verifiable-postgres/proxy/pkg/types"
 )
 
@@ -24,10 +25,11 @@ type Engine struct {
 	workerWg   sync.WaitGroup
 	ctx        context.Context
 	cancel     context.CancelFunc
+	metrics    *metrics.Metrics
 }
 
 // NewEngine creates a new replay engine
-func NewEngine(cfg *config.Config, jobQueue chan types.VerificationJob) (*Engine, error) {
+func NewEngine(cfg *config.Config, jobQueue chan types.VerificationJob, metrics *metrics.Metrics) (*Engine, error) {
 	// Create context with cancel
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -37,6 +39,7 @@ func NewEngine(cfg *config.Config, jobQueue chan types.VerificationJob) (*Engine
 		jobQueue: jobQueue,
 		ctx:      ctx,
 		cancel:   cancel,
+		metrics:  metrics,
 	}
 
 	return engine, nil
@@ -108,6 +111,10 @@ func (e *Engine) worker(ctx context.Context, id int) {
 
 // processJob processes a verification job
 func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) types.VerificationResult {
+	// Record metrics for verification job
+	startTime := time.Now()
+	e.metrics.VerificationStarted()
+	
 	// Create result with basic info
 	result := types.VerificationResult{
 		TxID:            job.TxID,
@@ -121,6 +128,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 	db, err := sql.Open("pgx", e.cfg.VerificationDB.DSN())
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to connect to verification DB: %v", err)
+		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 	defer db.Close()
@@ -129,6 +137,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to begin transaction: %v", err)
+		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 
@@ -138,24 +147,28 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 	// Setup verification database with pre-state
 	if err := SetupVerificationDB(ctx, tx, job.TableSchemas, job.PreStateData); err != nil {
 		result.Error = fmt.Sprintf("Failed to setup verification DB: %v", err)
+		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 
 	// Set deterministic session parameters
 	if err := SetDeterministicSessionParams(ctx, tx); err != nil {
 		result.Error = fmt.Sprintf("Failed to set deterministic session parameters: %v", err)
+		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 
 	// Execute queries deterministically
 	if err := ExecuteQueriesDeterministically(ctx, tx, job.QuerySequence); err != nil {
 		result.Error = fmt.Sprintf("Failed to execute queries: %v", err)
+		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 
 	// Commit transaction to apply changes
 	if err := tx.Commit(); err != nil {
 		result.Error = fmt.Sprintf("Failed to commit transaction: %v", err)
+		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 
@@ -163,6 +176,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 	tx, err = db.BeginTx(ctx, nil)
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to begin post-state transaction: %v", err)
+		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 	defer tx.Rollback()
@@ -182,6 +196,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 	postStateData, _, err := capture.CapturePostState(ctx, queryInfo, db)
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to capture post-state: %v", err)
+		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 
@@ -196,6 +211,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 		tableRoot, err := commitment.GenerateTableRoot(tableState)
 		if err != nil {
 			result.Error = fmt.Sprintf("Failed to generate table root: %v", err)
+			e.metrics.VerificationCompleted(false, time.Since(startTime))
 			return result
 		}
 		tableRoots[tableName] = tableRoot
@@ -205,6 +221,7 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 	postRootCalculated, err := commitment.GenerateDatabaseRoot(tableRoots)
 	if err != nil {
 		result.Error = fmt.Sprintf("Failed to generate database root: %v", err)
+		e.metrics.VerificationCompleted(false, time.Since(startTime))
 		return result
 	}
 
@@ -212,15 +229,18 @@ func (e *Engine) processJob(ctx context.Context, job types.VerificationJob) type
 	result.PostRootCalculated = postRootCalculated
 
 	// Compare roots
-	if postRootCalculated == job.PostRootClaimed {
-		result.Success = true
-	} else {
-		result.Success = false
+	success := postRootCalculated == job.PostRootClaimed
+	result.Success = success
+	
+	if !success {
 		result.Mismatches = []string{
 			fmt.Sprintf("Post-state root mismatch: claimed %x, calculated %x", 
 				job.PostRootClaimed, postRootCalculated),
 		}
 	}
+	
+	// Record metrics for completed verification
+	e.metrics.VerificationCompleted(success, time.Since(startTime))
 
 	return result
 }

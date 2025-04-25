@@ -9,8 +9,9 @@ import (
 
 	"github.com/verifiable-postgres/proxy/pkg/config"
 	"github.com/verifiable-postgres/proxy/pkg/log"
-	"github.com/verifiable-postgres/proxy/pkg/types"
+	"github.com/verifiable-postgres/proxy/pkg/metrics"
 	"github.com/verifiable-postgres/proxy/pkg/replay"
+	"github.com/verifiable-postgres/proxy/pkg/types"
 )
 
 // Server represents the PostgreSQL proxy server
@@ -23,6 +24,7 @@ type Server struct {
 	nextTxID     uint64
 	replayEngine *replay.Engine
 	jobQueue     chan types.VerificationJob
+	metrics      *metrics.Metrics
 	closed       bool
 }
 
@@ -30,17 +32,21 @@ type Server struct {
 func NewServer(cfg *config.Config) (*Server, error) {
 	// Create job queue for verification
 	jobQueue := make(chan types.VerificationJob, cfg.ReplayEngine.JobQueueSize)
+	
+	// Create metrics collector
+	metricsCollector := metrics.NewMetrics()
 
 	// Create server instance
 	server := &Server{
 		cfg:         cfg,
 		connections: make(map[uint64]*Connection),
 		jobQueue:    jobQueue,
+		metrics:     metricsCollector,
 	}
 
 	// Create replay engine if verification is enabled
 	if cfg.Features.EnableVerification {
-		engine, err := replay.NewEngine(cfg, jobQueue)
+		engine, err := replay.NewEngine(cfg, jobQueue, metricsCollector)
 		if err != nil {
 			return nil, err
 		}
@@ -48,6 +54,11 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	}
 
 	return server, nil
+}
+
+// GetMetrics returns the current metrics
+func (s *Server) GetMetrics() map[string]interface{} {
+	return s.metrics.GetMetrics()
 }
 
 // Start starts the server and listens for incoming connections

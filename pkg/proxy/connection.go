@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,15 +22,19 @@ import (
 
 // Connection represents a client connection to the proxy
 type Connection struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	server     *Server
-	id         uint64
-	clientConn net.Conn
-	backendDB  *sql.DB
-	txID       uint64
-	closed     bool
-	mu         sync.Mutex
+	ctx             context.Context
+	cancel          context.CancelFunc
+	server          *Server
+	id              uint64
+	clientConn      net.Conn
+	backendDB       *sql.DB
+	backendTx       *sql.Tx
+	txID            uint64
+	inTransaction   bool
+	transactionMode byte // 'I' (idle), 'T' (in transaction), 'E' (failed transaction)
+	closed          bool
+	mu              sync.Mutex
+	queryCount      int // Count of queries in the current transaction
 }
 
 // NewConnection creates a new connection
@@ -53,13 +58,19 @@ func NewConnection(ctx context.Context, server *Server, id uint64, clientConn ne
 
 	// Create the connection
 	conn := &Connection{
-		ctx:        ctx,
-		cancel:     cancel,
-		server:     server,
-		id:         id,
-		clientConn: clientConn,
-		backendDB:  backendDB,
+		ctx:             ctx,
+		cancel:          cancel,
+		server:          server,
+		id:              id,
+		clientConn:      clientConn,
+		backendDB:       backendDB,
+		inTransaction:   false,
+		transactionMode: 'I', // Idle
+		queryCount:      0,
 	}
+
+	// Update metrics
+	server.metrics.ConnectionStarted()
 
 	log.Info("New connection established", "id", id)
 	return conn, nil
@@ -68,6 +79,9 @@ func NewConnection(ctx context.Context, server *Server, id uint64, clientConn ne
 // Handle handles the connection
 func (c *Connection) Handle() error {
 	defer c.Close()
+
+	// Initialize transaction mode
+	c.transactionMode = 'I' // Idle - not in transaction
 
 	// Handle the startup message
 	startupMsg, err := c.readStartupMessage()
@@ -139,14 +153,74 @@ func (c *Connection) Handle() error {
 			if err := c.handleQuery(&pgproto3.Query{String: queryString}); err != nil {
 				return err
 			}
+		case 'P': // Parse (Extended Query Protocol)
+			if err := c.handleExtendedQuery(typeBuf[0], messageBuf); err != nil {
+				return err
+			}
+		case 'B': // Bind (Extended Query Protocol)
+			if err := c.handleExtendedQuery(typeBuf[0], messageBuf); err != nil {
+				return err
+			}
+		case 'E': // Execute (Extended Query Protocol)
+			if err := c.handleExtendedQuery(typeBuf[0], messageBuf); err != nil {
+				return err
+			}
+		case 'D': // Describe (Extended Query Protocol)
+			if err := c.handleExtendedQuery(typeBuf[0], messageBuf); err != nil {
+				return err
+			}
+		case 'S': // Sync (Extended Query Protocol)
+			if err := c.handleExtendedQuery(typeBuf[0], messageBuf); err != nil {
+				return err
+			}
 		case 'X': // Terminate
+			// End any open transaction before terminating
+			if c.inTransaction && c.backendTx != nil {
+				c.backendTx.Rollback()
+				c.inTransaction = false
+				c.backendTx = nil
+				// Update metrics for implicit rollback on connection termination
+				c.server.metrics.TransactionRolledBack()
+			}
 			return nil // Connection will be closed after this function returns
 		default:
-			// Log unsupported message type
+			// Log and handle the unsupported message, but don't disconnect
 			log.Warn("Unsupported message type", "type", string(typeBuf))
-			return fmt.Errorf("unsupported message type: %c", typeBuf[0])
+			// Send error to client
+			err := c.sendErrorResponse("ERROR", "08P01", fmt.Sprintf("Unsupported message type: %c", typeBuf[0]))
+			if err != nil {
+				return fmt.Errorf("failed to send error response: %w", err)
+			}
+			
+			// Send ReadyForQuery to keep the connection alive
+			err = c.sendReadyForQuery()
+			if err != nil {
+				return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+			}
 		}
 	}
+}
+
+// handleExtendedQuery handles extended query protocol messages
+// This is a placeholder in V1 that just returns an error message
+// to the client that extended query protocol is not supported yet
+func (c *Connection) handleExtendedQuery(msgType byte, msgBody []byte) error {
+	// Log attempt
+	log.Warn("Extended Query Protocol not fully supported", "type", string(msgType))
+	
+	// Send error to client
+	err := c.sendErrorResponse("ERROR", "0A000", "Extended Query Protocol not fully supported in V1")
+	if err != nil {
+		return fmt.Errorf("failed to send error response: %w", err)
+	}
+	
+	// Send ReadyForQuery
+	err = c.sendReadyForQuery()
+	if err != nil {
+		return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+	}
+	
+	return nil
 }
 
 // readStartupMessage reads the startup message from the client
@@ -361,10 +435,20 @@ func (c *Connection) sendErrorResponse(severity, code, message string) error {
 
 // sendReadyForQuery sends a ReadyForQuery message to the client
 func (c *Connection) sendReadyForQuery() error {
+	// Use the appropriate transaction status
+	txStatus := 'I' // Idle - not in transaction
+	if c.inTransaction {
+		if c.transactionMode == 'E' {
+			txStatus = 'E' // Failed transaction
+		} else {
+			txStatus = 'T' // In transaction
+		}
+	}
+
 	readyForQuery := []byte{
 		'Z',                          // ReadyForQuery
 		0, 0, 0, 5,                   // Message length (including self)
-		'I',                          // Idle state
+		byte(txStatus),               // Transaction status
 	}
 	_, err := c.clientConn.Write(readyForQuery)
 	return err
@@ -534,6 +618,25 @@ func (c *Connection) sendCommandComplete(tag string) error {
 
 // handleQuery handles a query message
 func (c *Connection) handleQuery(msg *pgproto3.Query) error {
+	// Check for transaction commands
+	trimmedQuery := strings.TrimSpace(msg.String)
+	upperQuery := strings.ToUpper(trimmedQuery)
+
+	// Handle transaction commands
+	if upperQuery == "BEGIN" || upperQuery == "START TRANSACTION" {
+		return c.handleBeginTransaction()
+	} else if upperQuery == "COMMIT" || upperQuery == "END" {
+		return c.handleCommitTransaction()
+	} else if upperQuery == "ROLLBACK" {
+		return c.handleRollbackTransaction()
+	} else if strings.HasPrefix(upperQuery, "SAVEPOINT") {
+		return c.handleSavepoint(msg.String)
+	} else if strings.HasPrefix(upperQuery, "ROLLBACK TO SAVEPOINT") {
+		return c.handleRollbackToSavepoint(msg.String)
+	} else if strings.HasPrefix(upperQuery, "RELEASE SAVEPOINT") {
+		return c.handleReleaseSavepoint(msg.String)
+	}
+
 	// Analyze the query
 	queryInfo, err := interceptor.AnalyzeQuery(msg.String)
 	if err != nil {
@@ -566,7 +669,14 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 	if queryInfo.Type == types.Insert || queryInfo.Type == types.Update || queryInfo.Type == types.Delete {
 		// Capture pre-state for affected tables
 		var captureErr error
-		preStateData, tableSchemas, captureErr = capture.CapturePreState(c.ctx, queryInfo, c.backendDB)
+		
+		// Use transaction if in one, otherwise use the direct DB connection
+		if c.inTransaction && c.backendTx != nil {
+			preStateData, tableSchemas, captureErr = capture.CapturePreStateInTx(c.ctx, queryInfo, c.backendTx)
+		} else {
+			preStateData, tableSchemas, captureErr = capture.CapturePreState(c.ctx, queryInfo, c.backendDB)
+		}
+		
 		if captureErr != nil {
 			log.Error("Failed to capture pre-state", "error", captureErr)
 			// Continue anyway, we'll just have less accurate verification
@@ -597,23 +707,39 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 	}
 
 	// Execute the query on the backend database
-	rows, err := c.backendDB.QueryContext(c.ctx, msg.String)
-	if err != nil {
-		log.Error("Failed to execute query", "error", err, "query", msg.String)
+	var rows *sql.Rows
+	var execErr error
+	
+	// Execute the query in the current transaction if we're in one
+	if c.inTransaction && c.backendTx != nil {
+		rows, execErr = c.backendTx.QueryContext(c.ctx, msg.String)
+	} else {
+		rows, execErr = c.backendDB.QueryContext(c.ctx, msg.String)
+	}
+	
+	if execErr != nil {
+		log.Error("Failed to execute query", "error", execErr, "query", msg.String)
+		
+		// If in a transaction, mark it as failed
+		if c.inTransaction {
+			c.transactionMode = 'E' // Error state
+		}
+		
 		// Send error to client
-		errMsg := fmt.Sprintf("Error executing query: %s", err)
+		errMsg := fmt.Sprintf("Error executing query: %s", execErr)
 		err := c.sendErrorResponse("ERROR", "42000", errMsg)
 		if err != nil {
 			return fmt.Errorf("failed to send error response: %w", err)
 		}
 		
-		// Send ReadyForQuery
+		// Send ReadyForQuery with correct transaction status
 		err = c.sendReadyForQuery()
 		if err != nil {
 			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
 		}
 		return nil
 	}
+	
 	defer rows.Close()
 
 	// Process the result rows and send to client
@@ -669,7 +795,16 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 
 	if queryInfo.Type == types.Insert || queryInfo.Type == types.Update || queryInfo.Type == types.Delete {
 		// Capture post-state for affected tables
-		postStateData, _, captureErr := capture.CapturePostState(c.ctx, queryInfo, c.backendDB)
+		var postStateData map[string][]types.Row
+		var captureErr error
+		
+		// Use transaction if in one, otherwise use the direct DB connection
+		if c.inTransaction && c.backendTx != nil {
+			postStateData, _, captureErr = capture.CapturePostStateInTx(c.ctx, queryInfo, c.backendTx)
+		} else {
+			postStateData, _, captureErr = capture.CapturePostState(c.ctx, queryInfo, c.backendDB)
+		}
+		
 		if captureErr != nil {
 			log.Error("Failed to capture post-state", "error", captureErr)
 			// Continue anyway, we'll just have less accurate verification
@@ -712,8 +847,9 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 		}
 		log.LogStateCommitment(c.ctx, record)
 
-		// Send verification job
-		if c.server.cfg.Features.EnableVerification {
+		// Only send verification job if not in a transaction
+		// For transactions, we'll accumulate queries and send at COMMIT time
+		if !c.inTransaction && c.server.cfg.Features.EnableVerification {
 			job := types.VerificationJob{
 				TxID:            txID,
 				QuerySequence:   []string{msg.String},
@@ -744,10 +880,367 @@ func (c *Connection) handleQuery(msg *pgproto3.Query) error {
 		return fmt.Errorf("failed to send command complete: %w", err)
 	}
 
-	// Send ready for query
+	// Send ready for query with the correct transaction status
 	err = c.sendReadyForQuery()
 	if err != nil {
 		return fmt.Errorf("failed to send ready for query: %w", err)
+	}
+
+	return nil
+}
+
+// handleBeginTransaction starts a new transaction
+func (c *Connection) handleBeginTransaction() error {
+	// Check if already in a transaction
+	if c.inTransaction {
+		// Already in a transaction, send warning
+		err := c.sendErrorResponse("WARNING", "25001", "Already in a transaction block")
+		if err != nil {
+			return fmt.Errorf("failed to send warning: %w", err)
+		}
+		
+		// Send ready for query with transaction status
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Start a new transaction
+	tx, err := c.backendDB.BeginTx(c.ctx, nil)
+	if err != nil {
+		log.Error("Failed to begin transaction", "error", err)
+		
+		// Send error to client
+		errMsg := fmt.Sprintf("Error beginning transaction: %s", err)
+		err := c.sendErrorResponse("ERROR", "XX000", errMsg)
+		if err != nil {
+			return fmt.Errorf("failed to send error response: %w", err)
+		}
+		
+		// Send ready for query
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Set transaction state
+	c.backendTx = tx
+	c.inTransaction = true
+	c.transactionMode = 'T' // In transaction
+	c.queryCount = 0
+	
+	// Update metrics
+	c.server.metrics.TransactionStarted()
+
+	// Send command complete
+	err = c.sendCommandComplete("BEGIN")
+	if err != nil {
+		return fmt.Errorf("failed to send command complete: %w", err)
+	}
+
+	// Send ready for query with transaction status
+	err = c.sendReadyForQuery()
+	if err != nil {
+		return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+	}
+
+	return nil
+}
+
+// handleCommitTransaction commits the current transaction
+func (c *Connection) handleCommitTransaction() error {
+	// Check if in a transaction
+	if !c.inTransaction || c.backendTx == nil {
+		// Not in a transaction, send warning
+		err := c.sendErrorResponse("WARNING", "25P01", "No transaction is in progress")
+		if err != nil {
+			return fmt.Errorf("failed to send warning: %w", err)
+		}
+		
+		// Send ready for query
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Commit the transaction
+	err := c.backendTx.Commit()
+	if err != nil {
+		log.Error("Failed to commit transaction", "error", err)
+		
+		// Send error to client
+		errMsg := fmt.Sprintf("Error committing transaction: %s", err)
+		err := c.sendErrorResponse("ERROR", "XX000", errMsg)
+		if err != nil {
+			return fmt.Errorf("failed to send error response: %w", err)
+		}
+		
+		// Reset transaction state
+		c.backendTx = nil
+		c.inTransaction = false
+		c.transactionMode = 'I' // Idle
+		
+		// Send ready for query
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Reset transaction state
+	c.backendTx = nil
+	c.inTransaction = false
+	c.transactionMode = 'I' // Idle
+
+	// Update metrics
+	c.server.metrics.TransactionCommitted()
+
+	// Send command complete
+	err = c.sendCommandComplete("COMMIT")
+	if err != nil {
+		return fmt.Errorf("failed to send command complete: %w", err)
+	}
+
+	// Send ready for query
+	err = c.sendReadyForQuery()
+	if err != nil {
+		return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+	}
+
+	return nil
+}
+
+// handleRollbackTransaction rolls back the current transaction
+func (c *Connection) handleRollbackTransaction() error {
+	// Check if in a transaction
+	if !c.inTransaction || c.backendTx == nil {
+		// Not in a transaction, send warning
+		err := c.sendErrorResponse("WARNING", "25P01", "No transaction is in progress")
+		if err != nil {
+			return fmt.Errorf("failed to send warning: %w", err)
+		}
+		
+		// Send ready for query
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Rollback the transaction
+	err := c.backendTx.Rollback()
+	if err != nil {
+		log.Error("Failed to rollback transaction", "error", err)
+		
+		// Send error to client
+		errMsg := fmt.Sprintf("Error rolling back transaction: %s", err)
+		err := c.sendErrorResponse("ERROR", "XX000", errMsg)
+		if err != nil {
+			return fmt.Errorf("failed to send error response: %w", err)
+		}
+		
+		// Reset transaction state anyway
+		c.backendTx = nil
+		c.inTransaction = false
+		c.transactionMode = 'I' // Idle
+		
+		// Send ready for query
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Reset transaction state
+	c.backendTx = nil
+	c.inTransaction = false
+	c.transactionMode = 'I' // Idle
+
+	// Update metrics
+	c.server.metrics.TransactionRolledBack()
+
+	// Send command complete
+	err = c.sendCommandComplete("ROLLBACK")
+	if err != nil {
+		return fmt.Errorf("failed to send command complete: %w", err)
+	}
+
+	// Send ready for query
+	err = c.sendReadyForQuery()
+	if err != nil {
+		return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+	}
+
+	return nil
+}
+
+// handleSavepoint handles a SAVEPOINT command
+func (c *Connection) handleSavepoint(query string) error {
+	// Check if in a transaction
+	if !c.inTransaction || c.backendTx == nil {
+		// Automatically start a transaction for the savepoint
+		err := c.handleBeginTransaction()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Execute the savepoint command
+	_, err := c.backendTx.ExecContext(c.ctx, query)
+	if err != nil {
+		log.Error("Failed to create savepoint", "error", err)
+		
+		// Send error to client
+		errMsg := fmt.Sprintf("Error creating savepoint: %s", err)
+		err := c.sendErrorResponse("ERROR", "XX000", errMsg)
+		if err != nil {
+			return fmt.Errorf("failed to send error response: %w", err)
+		}
+		
+		// Send ready for query with transaction status
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Send command complete
+	err = c.sendCommandComplete("SAVEPOINT")
+	if err != nil {
+		return fmt.Errorf("failed to send command complete: %w", err)
+	}
+
+	// Send ready for query with transaction status
+	err = c.sendReadyForQuery()
+	if err != nil {
+		return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+	}
+
+	return nil
+}
+
+// handleRollbackToSavepoint handles a ROLLBACK TO SAVEPOINT command
+func (c *Connection) handleRollbackToSavepoint(query string) error {
+	// Check if in a transaction
+	if !c.inTransaction || c.backendTx == nil {
+		// Not in a transaction, send error
+		err := c.sendErrorResponse("ERROR", "25P01", "No transaction is in progress")
+		if err != nil {
+			return fmt.Errorf("failed to send error: %w", err)
+		}
+		
+		// Send ready for query
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Execute the rollback to savepoint command
+	_, err := c.backendTx.ExecContext(c.ctx, query)
+	if err != nil {
+		log.Error("Failed to rollback to savepoint", "error", err)
+		
+		// Send error to client
+		errMsg := fmt.Sprintf("Error rolling back to savepoint: %s", err)
+		err := c.sendErrorResponse("ERROR", "XX000", errMsg)
+		if err != nil {
+			return fmt.Errorf("failed to send error response: %w", err)
+		}
+		
+		// Send ready for query with transaction status
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Send command complete
+	err = c.sendCommandComplete("ROLLBACK")
+	if err != nil {
+		return fmt.Errorf("failed to send command complete: %w", err)
+	}
+
+	// Send ready for query with transaction status
+	err = c.sendReadyForQuery()
+	if err != nil {
+		return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+	}
+
+	return nil
+}
+
+// handleReleaseSavepoint handles a RELEASE SAVEPOINT command
+func (c *Connection) handleReleaseSavepoint(query string) error {
+	// Check if in a transaction
+	if !c.inTransaction || c.backendTx == nil {
+		// Not in a transaction, send error
+		err := c.sendErrorResponse("ERROR", "25P01", "No transaction is in progress")
+		if err != nil {
+			return fmt.Errorf("failed to send error: %w", err)
+		}
+		
+		// Send ready for query
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Execute the release savepoint command
+	_, err := c.backendTx.ExecContext(c.ctx, query)
+	if err != nil {
+		log.Error("Failed to release savepoint", "error", err)
+		
+		// Send error to client
+		errMsg := fmt.Sprintf("Error releasing savepoint: %s", err)
+		err := c.sendErrorResponse("ERROR", "XX000", errMsg)
+		if err != nil {
+			return fmt.Errorf("failed to send error response: %w", err)
+		}
+		
+		// Send ready for query with transaction status
+		err = c.sendReadyForQuery()
+		if err != nil {
+			return fmt.Errorf("failed to send ReadyForQuery: %w", err)
+		}
+		
+		return nil
+	}
+
+	// Send command complete
+	err = c.sendCommandComplete("RELEASE")
+	if err != nil {
+		return fmt.Errorf("failed to send command complete: %w", err)
+	}
+
+	// Send ready for query with transaction status
+	err = c.sendReadyForQuery()
+	if err != nil {
+		return fmt.Errorf("failed to send ReadyForQuery: %w", err)
 	}
 
 	return nil
@@ -772,6 +1265,9 @@ func (c *Connection) Close() error {
 	if c.backendDB != nil {
 		c.backendDB.Close()
 	}
+	
+	// Update metrics
+	c.server.metrics.ConnectionClosed()
 
 	log.Info("Connection closed", "id", c.id)
 	return nil

@@ -23,7 +23,7 @@ make docker-up
 make docker-up-logs
 ```
 
-The proxy will be available on port 5432.
+The proxy will be available on port 5432. The backend database is available on port 5435, and the verification database on port 5434.
 
 ## Connecting to the Proxy
 
